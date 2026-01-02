@@ -1,33 +1,56 @@
+"""
+Data Preprocessing Pipeline for Text-to-SQL
+============================================
+This script processes the Spider dataset and prepares it for fine-tuning.
+Supports Qwen2.5-Coder and Phi-3 models.
+
+Usage:
+    python -m src.data.preprocess --model qwen
+    python -m src.data.preprocess --model phi3
+"""
+
 import json
 import os
+import argparse
+from pathlib import Path
+from typing import Dict, Any, Optional
 
 import sqlparse
 from datasets import Dataset
 from transformers import AutoTokenizer
+from tqdm import tqdm
+
+# Import from local modules
+import sys
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+
+from src.config import (
+    DATA_DIR,
+    OUTPUT_DIR,
+    TABLES_JSON,
+    TRAIN_SPIDER_JSON,
+    TRAIN_OTHERS_JSON,
+    DEV_JSON,
+    MODEL_CONFIG,
+    DATA_CONFIG,
+)
+from src.data.prompts.templates import Qwen25Template, Phi3Template, get_template
+
 
 # ==========================================
 # CONFIGURATION
 # ==========================================
-DATA_DIR = "spider_data"
-OUTPUT_DIR = "spider_processed_v3"
-MODEL_ID = "unsloth/llama-3-8b-Instruct-bnb-4bit"
-MAX_SEQ_LENGTH = 2048
-
-# Global Cache to speed up processing
-SCHEMA_CACHE = {}
+SCHEMA_CACHE: Dict[str, str] = {}
 
 
 # ==========================================
-# 1. DETERMINISTIC SCHEMA SERIALIZER (Cached)
+# SCHEMA SERIALIZATION
 # ==========================================
-def serialize_schema_sorted(db_id, db_schemas):
+def serialize_schema_structured(db_id: str, db_schemas: Dict[str, Any]) -> str:
     """
-    Serializes schema with strict priority:
-    1. Primary Keys (Group 0)
-    2. Foreign Keys (Group 1)
-    3. Remaining columns (Group 2)
+    Serialize schema in structured text format.
+    Prioritizes: Primary Keys > Foreign Keys > Other columns
     """
-    # 🔧 Improvement 3: Schema Caching
     if db_id in SCHEMA_CACHE:
         return SCHEMA_CACHE[db_id]
 
@@ -36,28 +59,28 @@ def serialize_schema_sorted(db_id, db_schemas):
 
     schema_info = db_schemas[db_id]
 
-    # --- Unpack Metadata ---
+    # Unpack metadata
     table_names = schema_info["table_names_original"]
-    column_names = schema_info["column_names_original"]  # [[table_idx, name], ...]
+    column_names = schema_info["column_names_original"]
     column_types = schema_info["column_types"]
     primary_keys = set(schema_info["primary_keys"])
-    foreign_keys = schema_info["foreign_keys"]  # [[col_idx, ref_col_idx], ...]
+    foreign_keys = schema_info["foreign_keys"]
 
-    # --- Build FK Map ---
+    # Build FK map
     fk_map = {}
     for col_idx, ref_col_idx in foreign_keys:
         ref_table_idx, ref_col_name = column_names[ref_col_idx]
         ref_table_name = table_names[ref_table_idx]
         fk_map[col_idx] = f"foreign key -> {ref_table_name}.{ref_col_name}"
 
-    # --- Build Table Objects ---
+    # Build table objects
     tables = {i: [] for i in range(len(table_names))}
 
     for idx, (table_idx, col_name) in enumerate(column_names):
         if table_idx < 0:
             continue  # Skip '*' wildcard
 
-        # Build Description
+        # Build description
         details = [column_types[idx]]
         is_pk = idx in primary_keys
         is_fk = idx in fk_map
@@ -69,44 +92,84 @@ def serialize_schema_sorted(db_id, db_schemas):
 
         col_str = f"{col_name} ({', '.join(details)})"
 
-        # Store with sorting metadata
-        tables[table_idx].append(
-            {"text": col_str, "is_pk": is_pk, "is_fk": is_fk, "orig_idx": idx}
-        )
+        tables[table_idx].append({
+            "text": col_str,
+            "is_pk": is_pk,
+            "is_fk": is_fk,
+            "orig_idx": idx
+        })
 
-    # --- Format Output with Strict Sorting ---
+    # Format output with strict sorting
     schema_lines = []
     for i, table_name in enumerate(table_names):
         cols = tables[i]
 
-        # ✅ Fix 1: Explicit Priority Logic
+        # Priority: PK > FK > Others
         def sort_key(c):
             if c["is_pk"]:
-                return (0, c["orig_idx"])  # Priority 1: PK
+                return (0, c["orig_idx"])
             if c["is_fk"]:
-                return (1, c["orig_idx"])  # Priority 2: FK
-            return (2, c["orig_idx"])  # Priority 3: Others
+                return (1, c["orig_idx"])
+            return (2, c["orig_idx"])
 
         sorted_cols = sorted(cols, key=sort_key)
-
         col_strings = [c["text"] for c in sorted_cols]
         cols_formatted = ", ".join(col_strings)
         schema_lines.append(f"Table: {table_name}\nColumns: {cols_formatted}")
 
     result = "\n\n".join(schema_lines)
-    SCHEMA_CACHE[db_id] = result  # Cache it
+    SCHEMA_CACHE[db_id] = result
+    return result
+
+
+def serialize_schema_ddl(db_id: str, db_schemas: Dict[str, Any]) -> str:
+    """
+    Serialize schema in DDL (CREATE TABLE) format.
+    """
+    cache_key = f"{db_id}_ddl"
+    if cache_key in SCHEMA_CACHE:
+        return SCHEMA_CACHE[cache_key]
+
+    if db_id not in db_schemas:
+        return ""
+
+    schema_info = db_schemas[db_id]
+    table_names = schema_info["table_names_original"]
+    column_names = schema_info["column_names_original"]
+    column_types = schema_info["column_types"]
+    primary_keys = set(schema_info["primary_keys"])
+
+    # Build tables
+    tables = {i: [] for i in range(len(table_names))}
+    for idx, (table_idx, col_name) in enumerate(column_names):
+        if table_idx < 0:
+            continue
+        col_type = column_types[idx]
+        pk_str = " PRIMARY KEY" if idx in primary_keys else ""
+        tables[table_idx].append(f"  {col_name} {col_type}{pk_str}")
+
+    # Format as CREATE TABLE statements
+    ddl_statements = []
+    for i, table_name in enumerate(table_names):
+        cols_str = ",\n".join(tables[i])
+        ddl = f"CREATE TABLE {table_name} (\n{cols_str}\n);"
+        ddl_statements.append(ddl)
+
+    result = "\n\n".join(ddl_statements)
+    SCHEMA_CACHE[cache_key] = result
     return result
 
 
 # ==========================================
-# 2. SAFE SQL NORMALIZER
+# SQL NORMALIZATION
 # ==========================================
-def normalize_sql(query):
+def normalize_sql(query: str) -> str:
     """
-    Attempts to uppercase keywords using sqlparse.
-    Fallbacks to raw query on failure to prevent silent data corruption.
+    Normalize SQL query formatting.
+    - Uppercase keywords
+    - Strip comments
+    - Clean whitespace
     """
-    # ✅ Fix 2: Safety Wrapper
     try:
         formatted = sqlparse.format(
             query,
@@ -122,139 +185,200 @@ def normalize_sql(query):
 
 
 # ==========================================
-# 3. PROMPT FORMATTER
+# DATA FORMATTING
 # ==========================================
-def format_instruction(sample, db_schemas):
+def format_sample(
+    sample: Dict[str, Any],
+    db_schemas: Dict[str, Any],
+    template,
+    schema_format: str = "structured"
+) -> Dict[str, Any]:
+    """Format a single sample with the given template."""
     db_id = sample["db_id"]
     question = sample["question"]
     raw_query = sample["query"]
 
-    schema_context = serialize_schema_sorted(db_id, db_schemas)
+    # Get schema
+    if schema_format == "ddl":
+        schema_context = serialize_schema_ddl(db_id, db_schemas)
+    else:
+        schema_context = serialize_schema_structured(db_id, db_schemas)
+
+    # Normalize SQL
     target_sql = normalize_sql(raw_query)
 
-    sys_prompt = (
-        "You are a text-to-SQL AI assistant. "
-        "Your goal is to output valid, executable SQL for the given SQLite schema. "
-        "Pay attention to primary and foreign keys."
+    # Format with template
+    formatted_text = template.format_prompt(
+        schema=schema_context,
+        question=question,
+        sql=target_sql,
+        include_response=True
     )
-
-    # Llama-3 Chat Format
-    formatted_text = f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
-
-{sys_prompt}<|eot_id|><|start_header_id|>user<|end_header_id|>
-
-### Database Schema:
-{schema_context}
-
-### Question:
-{question}<|eot_id|><|start_header_id|>assistant<|end_header_id|>
-
-{target_sql}<|eot_id|>"""
 
     return {
         "text": formatted_text,
-        "db_id": db_id,  # 🔧 Improvement 2: Meta-data for analysis
+        "db_id": db_id,
+        "question": question,
         "raw_query": raw_query,
         "target_sql": target_sql,
     }
 
 
 # ==========================================
-# 4. MAIN EXECUTION
+# MAIN PIPELINE
 # ==========================================
-def main():
-    print(f"🚀 Starting Preprocessing Pipeline (v3.0)...")
+def main(args):
+    print(f"🚀 Starting Preprocessing Pipeline")
+    print(f"   Model: {args.model}")
+    print(f"   Schema Format: {args.schema_format}")
+    print(f"   Max Sequence Length: {args.max_seq_length}")
+    print()
 
-    # --- A. Load Schemas ---
-    tables_path = os.path.join(DATA_DIR, "tables.json")
-    if not os.path.exists(tables_path):
-        raise FileNotFoundError(f"Missing {tables_path}")
+    # Select template based on model
+    if args.model == "qwen":
+        template = Qwen25Template()
+        model_id = "Qwen/Qwen2.5-Coder-7B-Instruct"
+    elif args.model == "phi3":
+        template = Phi3Template()
+        model_id = "microsoft/Phi-3-mini-4k-instruct"
+    else:
+        raise ValueError(f"Unknown model: {args.model}")
 
-    with open(tables_path, "r") as f:
+    print(f"📦 Using template: {template.name}")
+    print(f"📦 Model ID: {model_id}")
+
+    # --- Load Schemas ---
+    print("\n📂 Loading schemas...")
+    if not TABLES_JSON.exists():
+        raise FileNotFoundError(f"Missing {TABLES_JSON}")
+
+    with open(TABLES_JSON, "r") as f:
         tables_data = json.load(f)
     db_schemas = {db["db_id"]: db for db in tables_data}
+    print(f"   Loaded {len(db_schemas)} database schemas")
 
-    # --- B. Load & Merge Datasets ---
-    with open(os.path.join(DATA_DIR, "train_spider.json"), "r") as f:
+    # --- Load Datasets ---
+    print("\n📂 Loading datasets...")
+    with open(TRAIN_SPIDER_JSON, "r") as f:
         train_spider = json.load(f)
-    with open(os.path.join(DATA_DIR, "train_others.json"), "r") as f:
+    with open(TRAIN_OTHERS_JSON, "r") as f:
         train_others = json.load(f)
-
-    raw_train = train_spider + train_others
-
-    with open(os.path.join(DATA_DIR, "dev.json"), "r") as f:
+    with open(DEV_JSON, "r") as f:
         raw_dev = json.load(f)
 
-    # --- C. ❌ Fix 3: Strict Leakage Check ---
-    print("🔎 Checking for Data Leakage...")
+    raw_train = train_spider + train_others
+    print(f"   Train: {len(raw_train)} samples ({len(train_spider)} spider + {len(train_others)} others)")
+    print(f"   Dev: {len(raw_dev)} samples")
+
+    # --- Check for Data Leakage ---
+    print("\n🔎 Checking for data leakage...")
     train_db_ids = {ex["db_id"] for ex in raw_train}
     dev_db_ids = {ex["db_id"] for ex in raw_dev}
 
     if not train_db_ids.isdisjoint(dev_db_ids):
         overlap = train_db_ids.intersection(dev_db_ids)
         raise ValueError(f"❌ CRITICAL: DB Leakage detected! Overlap: {overlap}")
-    print("✅ No Leakage detected. Train/Dev schemas are disjoint.")
+    print("   ✅ No leakage detected. Train/Dev schemas are disjoint.")
 
-    # --- D. Formatting ---
-    print("⚙️ Formatting training data...")
-    train_data_formatted = [format_instruction(ex, db_schemas) for ex in raw_train]
+    # --- Format Data ---
+    print("\n⚙️ Formatting training data...")
+    train_formatted = [
+        format_sample(ex, db_schemas, template, args.schema_format)
+        for ex in tqdm(raw_train, desc="Train")
+    ]
 
     print("⚙️ Formatting validation data...")
-    dev_data_formatted = [format_instruction(ex, db_schemas) for ex in raw_dev]
-
-    train_dataset = Dataset.from_list(train_data_formatted)
-    eval_dataset = Dataset.from_list(dev_data_formatted)
-
-    # --- E. Tokenizer Checks & Filtering ---
-    print("📚 Loading Tokenizer...")
-    try:
-        tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
-    except Exception as e:
-        print(f"Warning: Could not load specific tokenizer ({e}). Using base Llama-3.")
-        tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3-8B-Instruct")
-
-    # ✅ Fix 4: Verify Special Tokens
-    required_tokens = [
-        "<|begin_of_text|>",
-        "<|start_header_id|>",
-        "<|end_header_id|>",
-        "<|eot_id|>",
+    dev_formatted = [
+        format_sample(ex, db_schemas, template, args.schema_format)
+        for ex in tqdm(raw_dev, desc="Dev")
     ]
-    vocab = tokenizer.get_vocab()
-    missing_tokens = [t for t in required_tokens if t not in vocab]
 
-    if missing_tokens:
-        raise ValueError(
-            f"❌ Tokenizer is missing critical Llama-3 tokens: {missing_tokens}"
-        )
-    print("✅ Tokenizer vocabulary verified.")
+    train_dataset = Dataset.from_list(train_formatted)
+    eval_dataset = Dataset.from_list(dev_formatted)
 
-    print("✂️ Filtering long sequences...")
+    # --- Tokenizer Check & Filtering ---
+    print("\n📚 Loading tokenizer...")
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+    except Exception as e:
+        print(f"   ⚠️ Could not load tokenizer: {e}")
+        print("   Using fallback tokenizer for length estimation...")
+        tokenizer = None
 
-    def is_valid_length(sample):
-        return len(tokenizer(sample["text"])["input_ids"]) <= MAX_SEQ_LENGTH
+    if tokenizer and args.filter_long:
+        print(f"✂️ Filtering sequences > {args.max_seq_length} tokens...")
+        
+        def is_valid_length(sample):
+            tokens = tokenizer(sample["text"], truncation=False)["input_ids"]
+            return len(tokens) <= args.max_seq_length
 
-    original_len = len(train_dataset)
-    train_dataset = train_dataset.filter(is_valid_length)
-    print(
-        f"Filtered {original_len - len(train_dataset)} samples exceeded {MAX_SEQ_LENGTH} tokens."
-    )
+        original_len = len(train_dataset)
+        train_dataset = train_dataset.filter(is_valid_length)
+        filtered_count = original_len - len(train_dataset)
+        print(f"   Filtered {filtered_count} samples exceeding {args.max_seq_length} tokens.")
 
-    # --- F. Save ---
-    if not os.path.exists(OUTPUT_DIR):
-        os.makedirs(OUTPUT_DIR)
+    # --- Save Datasets ---
+    output_path = OUTPUT_DIR / args.model
+    output_path.mkdir(parents=True, exist_ok=True)
 
-    train_dataset.save_to_disk(os.path.join(OUTPUT_DIR, "train"))
-    eval_dataset.save_to_disk(os.path.join(OUTPUT_DIR, "validation"))
+    train_path = output_path / "train"
+    eval_path = output_path / "validation"
 
-    print(f"\n✅ SUCCESS! Processed data saved to {OUTPUT_DIR}")
+    print(f"\n💾 Saving datasets to {output_path}...")
+    train_dataset.save_to_disk(str(train_path))
+    eval_dataset.save_to_disk(str(eval_path))
+
+    # --- Summary ---
+    print(f"\n{'='*60}")
+    print(f"✅ SUCCESS! Preprocessing complete.")
+    print(f"{'='*60}")
+    print(f"   Model: {args.model}")
+    print(f"   Template: {template.name} (v{template.version})")
     print(f"   Train Size: {len(train_dataset)}")
-    print(f"   Val Size:   {len(eval_dataset)}")
+    print(f"   Val Size: {len(eval_dataset)}")
+    print(f"   Output: {output_path}")
+    print()
 
-    # Final Visual Check
-    print("\n--- SAMPLE INPUT PREVIEW (Check Sorting) ---")
-    print(train_dataset[0]["text"][:800])
+    # Preview
+    print("--- SAMPLE PREVIEW ---")
+    print(train_dataset[0]["text"][:1000])
+    print("...")
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Preprocess Spider dataset for Text-to-SQL")
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="qwen",
+        choices=["qwen", "phi3"],
+        help="Model to prepare data for (qwen or phi3)"
+    )
+    parser.add_argument(
+        "--schema-format",
+        type=str,
+        default="structured",
+        choices=["structured", "ddl"],
+        help="Schema serialization format"
+    )
+    parser.add_argument(
+        "--max-seq-length",
+        type=int,
+        default=2048,
+        help="Maximum sequence length in tokens"
+    )
+    parser.add_argument(
+        "--filter-long",
+        action="store_true",
+        default=True,
+        help="Filter samples exceeding max sequence length"
+    )
+    parser.add_argument(
+        "--no-filter",
+        action="store_false",
+        dest="filter_long",
+        help="Don't filter long samples"
+    )
+    
+    args = parser.parse_args()
+    main(args)
