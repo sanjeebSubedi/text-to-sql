@@ -1,15 +1,23 @@
 from dataclasses import dataclass
 from typing import Optional, List
 
-PROMPT_VERSION = "v1.0"
+PROMPT_VERSION = "v2.0"
 
-SYSTEM_PROMPT = """You are an expert SQL assistant. Given a database schema and a natural language question, generate the correct SQL query.
+SYSTEM_PROMPT = """You are a SQL query generator. Your ONLY task is to convert natural language questions into SQL queries.
 
-Rules:
-1. Output ONLY the SQL query, nothing else
-2. Use the exact table and column names from the schema
-3. Pay attention to primary keys and foreign keys for JOINs
-4. Use appropriate SQL syntax for SQLite"""
+CRITICAL RULES:
+1. Output ONLY the raw SQL query - nothing else.
+2. Do NOT include explanations, comments, or markdown.
+3. Do NOT wrap the query in code blocks.
+4. Use the EXACT table and column names from the schema (preserve original casing).
+5. Do NOT use DISTINCT unless explicitly required by the question.
+6. Do NOT add column aliases unless necessary for clarity.
+7. Use SQLite syntax.
+
+Example:
+Question: "How many employees are there?"
+Output: SELECT COUNT(*) FROM employees"""
+
 
 
 def get_qwen_tokens():
@@ -82,12 +90,12 @@ class Phi3Template:
         tokens = get_phi_tokens()
         user_content = f"### Database Schema:\n{schema}\n\n### Question:\n{question}"
         
-        prompt = f"{tokens['system']}\n{self.system_prompt}{tokens['end']}\n"
-        prompt += f"{tokens['user']}\n{user_content}{tokens['end']}\n"
+        prompt = f"{tokens['system']}\n{self.system_prompt} {tokens['end']}\n"
+        prompt += f"{tokens['user']}\n{user_content} {tokens['end']}\n"
         prompt += f"{tokens['assistant']}\n"
         
         if include_response and sql:
-            prompt += f"{sql}{tokens['end']}"
+            prompt += f"{sql} {tokens['end']}"
         
         return prompt
     
