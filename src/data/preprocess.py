@@ -19,6 +19,7 @@ import sqlparse
 from datasets import Dataset
 from transformers import AutoTokenizer
 from tqdm import tqdm
+import re
 
 # Import from local modules
 import sys
@@ -37,15 +38,9 @@ from src.config import (
 from src.data.prompts.templates import Qwen25Template, Phi3Template, get_template
 
 
-# ==========================================
-# CONFIGURATION
-# ==========================================
 SCHEMA_CACHE: Dict[str, str] = {}
 
 
-# ==========================================
-# SCHEMA SERIALIZATION
-# ==========================================
 def serialize_schema_structured(db_id: str, db_schemas: Dict[str, Any]) -> str:
     """
     Serialize schema in structured text format.
@@ -160,9 +155,6 @@ def serialize_schema_ddl(db_id: str, db_schemas: Dict[str, Any]) -> str:
     return result
 
 
-# ==========================================
-# SQL NORMALIZATION
-# ==========================================
 def normalize_sql(query: str) -> str:
     """
     Normalize SQL query formatting.
@@ -180,13 +172,10 @@ def normalize_sql(query: str) -> str:
         ).strip()
         return formatted if formatted else query.strip()
     except Exception as e:
-        print(f"⚠️ SQL Normalization failed for: {query[:50]}... Error: {e}")
+        print(f"SQL Normalization failed for: {query[:50]}... Error: {e}")
         return query.strip()
 
 
-# ==========================================
-# DATA FORMATTING
-# ==========================================
 def format_sample(
     sample: Dict[str, Any],
     db_schemas: Dict[str, Any],
@@ -224,14 +213,121 @@ def format_sample(
     }
 
 
-# ==========================================
-# MAIN PIPELINE
-# ==========================================
+
+def infer_difficulty(sql: str) -> str:
+    """
+    Infers difficulty based on SQL complexity heuristics.
+    Maps to oversampling multipliers.
+    """
+    sql_upper = sql.upper()
+    
+    # 1. Detect Components
+    has_join = "JOIN" in sql_upper
+    has_group = "GROUP BY" in sql_upper or "HAVING" in sql_upper
+    has_subquery = sql_upper.count("SELECT") > 1
+    has_set_op = re.search(r'\b(INTERSECT|UNION|EXCEPT)\b', sql_upper)
+    
+    # 2. Categorize & Assign Difficulty
+    # Priority 1: Extra Hard (3x)
+    if has_set_op or (has_subquery and has_join):
+        return "extra"
+
+    # Priority 2: Hard (2x)
+    elif has_join or has_subquery or has_group:
+        return "hard"
+        
+    # Priority 3: Easy (1x)
+    else:
+        return "easy"
+
+
+def oversample_by_difficulty(samples: list, multipliers: dict = None) -> list:
+    """
+    Oversample training samples based on inferred SQL complexity.
+    Fix #2: Address class imbalance.
+    
+    Args:
+        samples: List of raw training samples
+        multipliers: Dict of difficulty -> multiplier
+                    Default: {"easy": 1, "hard": 2, "extra": 3}
+    """
+    if multipliers is None:
+        multipliers = {"easy": 1, "hard": 2, "extra": 3}
+    
+    oversampled = []
+    difficulty_counts = {"easy": 0, "hard": 0, "extra": 0}
+    
+    for sample in samples:
+        sql = sample.get("query", "")
+        difficulty = infer_difficulty(sql)
+        
+        difficulty_counts[difficulty] += 1
+        mult = multipliers.get(difficulty, 1)
+        
+        for _ in range(mult):
+            oversampled.append(sample)
+    
+    print(f"Inferred difficulty distribution: {difficulty_counts}")
+    print(f"Original: {len(samples)} -> Oversampled: {len(oversampled)}")
+    
+    return oversampled
+
+
+def oversample_combined(samples: list, 
+                        difficulty_multipliers: dict = None,
+                        set_op_multiplier: int = 4) -> list:
+    """
+    Combined oversampling using MAX of difficulty and SET operation multipliers.
+    Avoids multiplicative bug (e.g., 3x * 4x = 12x would cause overfitting).
+    
+    Args:
+        samples: List of raw training samples
+        difficulty_multipliers: {"easy": 1, "hard": 2, "extra": 3}
+        set_op_multiplier: Multiplier for SET operations (default: 4)
+    """
+    if difficulty_multipliers is None:
+        difficulty_multipliers = {"easy": 1, "hard": 2, "extra": 3}
+    
+    set_pattern = re.compile(r'\b(INTERSECT|UNION|EXCEPT)\b', re.IGNORECASE)
+    
+    oversampled = []
+    stats = {"easy": 0, "hard": 0, "extra": 0, "set_ops": 0}
+    
+    for sample in samples:
+        sql = sample.get("query", "")
+        
+        # Get difficulty multiplier
+        difficulty = infer_difficulty(sql)
+        diff_mult = difficulty_multipliers.get(difficulty, 1)
+        
+        # Get SET operation multiplier
+        has_set_op = bool(set_pattern.search(sql))
+        set_mult = set_op_multiplier if has_set_op else 1
+        
+        # Use MAX to avoid multiplicative explosion
+        final_mult = max(diff_mult, set_mult)
+        
+        # Track stats
+        stats[difficulty] += 1
+        if has_set_op:
+            stats["set_ops"] += 1
+        
+        # Duplicate sample
+        for _ in range(final_mult):
+            oversampled.append(sample)
+    
+    print(f"Difficulty: easy={stats['easy']}, hard={stats['hard']}, extra={stats['extra']}")
+    print(f"SET operations: {stats['set_ops']}")
+    print(f"Original: {len(samples)} -> Oversampled: {len(oversampled)}")
+    
+    return oversampled
+
+
 def main(args):
-    print(f"🚀 Starting Preprocessing Pipeline")
-    print(f"   Model: {args.model}")
-    print(f"   Schema Format: {args.schema_format}")
-    print(f"   Max Sequence Length: {args.max_seq_length}")
+    print(f"Starting Preprocessing Pipeline")
+    print(f"Model: {args.model}")
+    print(f"Schema Format: {args.schema_format}")
+    print(f"Max Sequence Length: {args.max_seq_length}")
     print()
 
     # Select template based on model
@@ -244,21 +340,21 @@ def main(args):
     else:
         raise ValueError(f"Unknown model: {args.model}")
 
-    print(f"📦 Using template: {template.name}")
-    print(f"📦 Model ID: {model_id}")
+    print(f"Using template: {template.name}")
+    print(f"Model ID: {model_id}")
 
     # --- Load Schemas ---
-    print("\n📂 Loading schemas...")
+    print("\nLoading schemas...")
     if not TABLES_JSON.exists():
         raise FileNotFoundError(f"Missing {TABLES_JSON}")
 
     with open(TABLES_JSON, "r") as f:
         tables_data = json.load(f)
     db_schemas = {db["db_id"]: db for db in tables_data}
-    print(f"   Loaded {len(db_schemas)} database schemas")
+    print(f"Loaded {len(db_schemas)} database schemas")
 
     # --- Load Datasets ---
-    print("\n📂 Loading datasets...")
+    print("\nLoading datasets...")
     with open(TRAIN_SPIDER_JSON, "r") as f:
         train_spider = json.load(f)
     with open(TRAIN_OTHERS_JSON, "r") as f:
@@ -267,27 +363,36 @@ def main(args):
         raw_dev = json.load(f)
 
     raw_train = train_spider + train_others
-    print(f"   Train: {len(raw_train)} samples ({len(train_spider)} spider + {len(train_others)} others)")
-    print(f"   Dev: {len(raw_dev)} samples")
+    print(f"Train: {len(raw_train)} samples ({len(train_spider)} spider + {len(train_others)} others)")
+    print(f"Dev: {len(raw_dev)} samples")
 
     # --- Check for Data Leakage ---
-    print("\n🔎 Checking for data leakage...")
+    print("\nChecking for data leakage...")
     train_db_ids = {ex["db_id"] for ex in raw_train}
     dev_db_ids = {ex["db_id"] for ex in raw_dev}
 
     if not train_db_ids.isdisjoint(dev_db_ids):
         overlap = train_db_ids.intersection(dev_db_ids)
-        raise ValueError(f"❌ CRITICAL: DB Leakage detected! Overlap: {overlap}")
-    print("   ✅ No leakage detected. Train/Dev schemas are disjoint.")
+        raise ValueError(f"CRITICAL: DB Leakage detected! Overlap: {overlap}")
+    print("No leakage detected. Train/Dev schemas are disjoint.")
+
+    # --- Oversampling (Fix #2 & #3) ---
+    if args.oversample:
+        print("\nApplying combined oversampling (max of difficulty & SET op multipliers)...")
+        raw_train = oversample_combined(
+            raw_train,
+            difficulty_multipliers={"easy": 1, "hard": 2, "extra": 3},
+            set_op_multiplier=4
+        )
 
     # --- Format Data ---
-    print("\n⚙️ Formatting training data...")
+    print("\nFormatting training data...")
     train_formatted = [
         format_sample(ex, db_schemas, template, args.schema_format)
         for ex in tqdm(raw_train, desc="Train")
     ]
 
-    print("⚙️ Formatting validation data...")
+    print("Formatting validation data...")
     dev_formatted = [
         format_sample(ex, db_schemas, template, args.schema_format)
         for ex in tqdm(raw_dev, desc="Dev")
@@ -297,16 +402,16 @@ def main(args):
     eval_dataset = Dataset.from_list(dev_formatted)
 
     # --- Tokenizer Check & Filtering ---
-    print("\n📚 Loading tokenizer...")
+    print("\nLoading tokenizer...")
     try:
         tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
     except Exception as e:
-        print(f"   ⚠️ Could not load tokenizer: {e}")
-        print("   Using fallback tokenizer for length estimation...")
+        print(f"Could not load tokenizer: {e}")
+        print("Using fallback tokenizer for length estimation...")
         tokenizer = None
 
     if tokenizer and args.filter_long:
-        print(f"✂️ Filtering sequences > {args.max_seq_length} tokens...")
+        print(f"  Filtering sequences > {args.max_seq_length} tokens...")
         
         def is_valid_length(sample):
             tokens = tokenizer(sample["text"], truncation=False)["input_ids"]
@@ -315,7 +420,7 @@ def main(args):
         original_len = len(train_dataset)
         train_dataset = train_dataset.filter(is_valid_length)
         filtered_count = original_len - len(train_dataset)
-        print(f"   Filtered {filtered_count} samples exceeding {args.max_seq_length} tokens.")
+        print(f"Filtered {filtered_count} samples exceeding {args.max_seq_length} tokens.")
 
     # --- Save Datasets ---
     output_path = OUTPUT_DIR / args.model
@@ -324,19 +429,19 @@ def main(args):
     train_path = output_path / "train"
     eval_path = output_path / "validation"
 
-    print(f"\n💾 Saving datasets to {output_path}...")
+    print(f"\nSaving datasets to {output_path}...")
     train_dataset.save_to_disk(str(train_path))
     eval_dataset.save_to_disk(str(eval_path))
 
     # --- Summary ---
     print(f"\n{'='*60}")
-    print(f"✅ SUCCESS! Preprocessing complete.")
+    print(f"SUCCESS! Preprocessing complete.")
     print(f"{'='*60}")
-    print(f"   Model: {args.model}")
-    print(f"   Template: {template.name} (v{template.version})")
-    print(f"   Train Size: {len(train_dataset)}")
-    print(f"   Val Size: {len(eval_dataset)}")
-    print(f"   Output: {output_path}")
+    print(f"Model: {args.model}")
+    print(f"Template: {template.name} (v{template.version})")
+    print(f"Train Size: {len(train_dataset)}")
+    print(f"Val Size: {len(eval_dataset)}")
+    print(f"Output: {output_path}")
     print()
 
     # Preview
@@ -378,6 +483,18 @@ if __name__ == "__main__":
         action="store_false",
         dest="filter_long",
         help="Don't filter long samples"
+    )
+    parser.add_argument(
+        "--oversample",
+        action="store_true",
+        default=True,
+        help="Apply difficulty + SET operation oversampling (Run #2 fix)"
+    )
+    parser.add_argument(
+        "--no-oversample",
+        action="store_false",
+        dest="oversample",
+        help="Disable oversampling"
     )
     
     args = parser.parse_args()
