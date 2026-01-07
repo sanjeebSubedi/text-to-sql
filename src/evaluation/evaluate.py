@@ -1,9 +1,3 @@
-"""
-🚀 Fast Evaluation Script (Unsloth Optimized)
-=============================================
-Uses Unsloth kernels + Batching for 50x speedup.
-"""
-
 import os
 import sys
 import json
@@ -17,7 +11,7 @@ import re
 import torch
 from tqdm import tqdm
 import sqlparse
-from unsloth import FastLanguageModel # 🚀 Use Unsloth
+from unsloth import FastLanguageModel
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 # from src.config import DATA_DIR, OUTPUT_DIR, RESULTS_DIR
@@ -34,11 +28,9 @@ class EvalResult:
     execution_match: bool = False
     error: Optional[str] = None
 
-# ==========================================
 # 1. OPTIMIZED MODEL LOADER
-# ==========================================
 def load_model_optimized(adapter_path: str):
-    print(f"🚀 Loading adapter with Unsloth: {adapter_path}")
+    print(f"Loading adapter with Unsloth: {adapter_path}")
     
     # Load directly with Unsloth (Handles base model + adapter automatically)
     model, tokenizer = FastLanguageModel.from_pretrained(
@@ -48,7 +40,6 @@ def load_model_optimized(adapter_path: str):
         load_in_4bit = True,
     )
     
-    # 🚀 ENABLE INFERENCE MODE (2x Speedup)
     FastLanguageModel.for_inference(model)
     
     # Ensure padding side is left for batch generation
@@ -56,14 +47,11 @@ def load_model_optimized(adapter_path: str):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
         
-    print("✅ Model loaded & Optimized!")
+    print("Model loaded & Optimized!")
     return model, tokenizer
 
-# ==========================================
 # 2. BATCH GENERATION
-# ==========================================
 def generate_sql_batch(model, tokenizer, prompts: List[str]) -> List[str]:
-    # 🚀 Batch Tokenization
     inputs = tokenizer(
         prompts, 
         return_tensors="pt", 
@@ -76,7 +64,7 @@ def generate_sql_batch(model, tokenizer, prompts: List[str]) -> List[str]:
             **inputs,
             max_new_tokens=256,
             do_sample=False,        # Greedy decoding (Best for code)
-            use_cache=True,         # 🚀 CRITICAL: Must be True for speed
+            use_cache=True,         
             pad_token_id=tokenizer.pad_token_id,
             eos_token_id=tokenizer.eos_token_id,
         )
@@ -85,7 +73,6 @@ def generate_sql_batch(model, tokenizer, prompts: List[str]) -> List[str]:
     responses = tokenizer.batch_decode(outputs, skip_special_tokens=False)
     return responses
 
-# ... (Keep normalization/execution helper functions same as before) ...
 
 def normalize_sql(sql: str) -> str:
     if not sql: return ""
@@ -131,21 +118,27 @@ def load_schemas() -> Dict[str, str]:
         schemas[db_id] = "\n\n".join(schema_parts)
     return schemas
 
-# ==========================================
 # 3. PROMPT FORMATTING (Simplified)
-# ==========================================
 def format_prompt_batch(schemas, questions, db_ids, model_type="qwen") -> List[str]:
     prompts = []
     for q, db_id in zip(questions, db_ids):
         schema = schemas.get(db_id, "")
-        system = "You are an expert SQL assistant. Generate the correct SQL query."
+        system = """You are a SQL query generator. Your ONLY task is to convert natural language questions into SQL queries.
+
+CRITICAL RULES:
+1. Output ONLY the raw SQL query - nothing else.
+2. Do NOT include explanations, comments, or markdown.
+3. Do NOT wrap the query in code blocks.
+4. Use the EXACT table and column names from the schema (preserve original casing).
+5. Do NOT use DISTINCT unless explicitly required by the question.
+6. Do NOT add column aliases unless necessary for clarity.
+7. Use SQLite syntax."""
         user = f"### Database Schema:\n{schema}\n\n### Question:\n{q}"
         
         if model_type == "qwen":
             im_start, im_end = "<|im_start|>", "<|im_end|>"
             p = f"{im_start}system\n{system}{im_end}\n{im_start}user\n{user}{im_end}\n{im_start}assistant\n"
         else: # phi3
-            # Use the correct Phi-3 format we defined earlier
             p = f"<|system|>\n{system}<|end|>\n<|user|>\n{user} <|end|>\n<|assistant|>\n"
         prompts.append(p)
     return prompts
@@ -155,7 +148,6 @@ def extract_sql_batch(responses: List[str], model_type="qwen") -> List[str]:
     for r in responses:
         if model_type == "qwen":
             if "assistant" in r:
-                # Robust extraction for Qwen
                 parts = r.split("<|im_start|>assistant")
                 if len(parts) > 1:
                     clean = parts[-1].split("<|im_end|>")[0].strip()
@@ -169,12 +161,10 @@ def extract_sql_batch(responses: List[str], model_type="qwen") -> List[str]:
         sqls.append(r.strip()) # Fallback
     return sqls
 
-# ==========================================
 # 4. MAIN EVAL LOOP
-# ==========================================
 def evaluate(args):
     print("=" * 60)
-    print(" 🚀 FAST TEXT-TO-SQL EVALUATION")
+    print("FAST TEXT-TO-SQL EVALUATION")
     print("=" * 60)
     
     model, tokenizer = load_model_optimized(args.adapter)
@@ -190,7 +180,6 @@ def evaluate(args):
     results = []
     db_base_path = DATA_DIR / "database"
     
-    # 🚀 Process in Batches
     for i in tqdm(range(0, len(dev_data), args.batch_size), desc="Batch Eval"):
         batch = dev_data[i : i + args.batch_size]
         
@@ -245,7 +234,7 @@ def evaluate(args):
     # Stats
     total = len(results)
     correct_exec = sum(1 for r in results if r.execution_match)
-    print(f"\n✅ Execution Accuracy: {correct_exec/total*100:.2f}%")
+    print(f"\nExecution Accuracy: {correct_exec/total*100:.2f}%")
     correct_exact = sum(1 for r in results if r.exact_match)
     print(f"Exact Match: {correct_exact/total*100:.2f}%")
     
