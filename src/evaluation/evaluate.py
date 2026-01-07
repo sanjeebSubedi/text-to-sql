@@ -28,26 +28,35 @@ class EvalResult:
     execution_match: bool = False
     error: Optional[str] = None
 
-# 1. OPTIMIZED MODEL LOADER
-def load_model_optimized(adapter_path: str):
-    print(f"Loading adapter with Unsloth: {adapter_path}")
+# Base model IDs for evaluation without fine-tuning
+BASE_MODELS = {
+    "qwen": "unsloth/Qwen2.5-Coder-7B-Instruct-bnb-4bit",
+    "phi3": "unsloth/Phi-3-mini-4k-instruct-bnb-4bit",
+}
+
+# 1. MODEL LOADER (supports both adapter and base model)
+def load_model_optimized(adapter_path: str = None, base_model: bool = False, model_type: str = "qwen"):
+    if base_model:
+        model_id = BASE_MODELS.get(model_type)
+        print(f"Loading BASE model (no fine-tuning): {model_id}")
+    else:
+        model_id = adapter_path
+        print(f"Loading fine-tuned adapter: {adapter_path}")
     
-    # Load directly with Unsloth (Handles base model + adapter automatically)
     model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name = adapter_path, # Unsloth loads the base model defined in adapter_config
-        max_seq_length = 2048,
-        dtype = None,
-        load_in_4bit = True,
+        model_name=model_id,
+        max_seq_length=2048,
+        dtype=None,
+        load_in_4bit=True,
     )
     
     FastLanguageModel.for_inference(model)
     
-    # Ensure padding side is left for batch generation
     tokenizer.padding_side = "left"
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
         
-    print("Model loaded & Optimized!")
+    print("Model loaded!")
     return model, tokenizer
 
 # 2. BATCH GENERATION
@@ -118,7 +127,7 @@ def load_schemas() -> Dict[str, str]:
         schemas[db_id] = "\n\n".join(schema_parts)
     return schemas
 
-# 3. PROMPT FORMATTING (Simplified)
+# 3. PROMPT FORMATTING
 def format_prompt_batch(schemas, questions, db_ids, model_type="qwen") -> List[str]:
     prompts = []
     for q, db_id in zip(questions, db_ids):
@@ -164,10 +173,17 @@ def extract_sql_batch(responses: List[str], model_type="qwen") -> List[str]:
 # 4. MAIN EVAL LOOP
 def evaluate(args):
     print("=" * 60)
-    print("FAST TEXT-TO-SQL EVALUATION")
+    if args.base_model:
+        print(f"BASE MODEL EVALUATION ({args.model_type.upper()})")
+    else:
+        print("FINE-TUNED MODEL EVALUATION")
     print("=" * 60)
     
-    model, tokenizer = load_model_optimized(args.adapter)
+    model, tokenizer = load_model_optimized(
+        adapter_path=args.adapter,
+        base_model=args.base_model,
+        model_type=args.model_type
+    )
     schemas = load_schemas()
     
     print("\nLoading validation data...")
@@ -247,9 +263,14 @@ def evaluate(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--adapter", type=str, required=True)
-    parser.add_argument("--model-type", type=str, default="qwen")
-    parser.add_argument("--batch-size", type=int, default=8) # Default batch size
+    parser.add_argument("--adapter", type=str, default=None, help="Path to fine-tuned adapter")
+    parser.add_argument("--base-model", action="store_true", help="Evaluate base model without fine-tuning")
+    parser.add_argument("--model-type", type=str, default="qwen", choices=["qwen", "phi3"])
+    parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--max-samples", type=int, default=None)
     args = parser.parse_args()
+    
+    if not args.base_model and not args.adapter:
+        parser.error("Must specify either --adapter or --base-model")
+    
     evaluate(args)
