@@ -1,14 +1,3 @@
-"""
-Data Preprocessing Pipeline for Text-to-SQL
-============================================
-This script processes the Spider dataset and prepares it for fine-tuning.
-Supports Qwen2.5-Coder and Phi-3 models.
-
-Usage:
-    python -m src.data.preprocess --model qwen
-    python -m src.data.preprocess --model phi3
-"""
-
 import json
 import os
 import argparse
@@ -180,7 +169,8 @@ def format_sample(
     sample: Dict[str, Any],
     db_schemas: Dict[str, Any],
     template,
-    schema_format: str = "structured"
+    schema_format: str = "structured",
+    case_augment: bool = False
 ) -> Dict[str, Any]:
     """Format a single sample with the given template."""
     db_id = sample["db_id"]
@@ -195,6 +185,10 @@ def format_sample(
 
     # Normalize SQL
     target_sql = normalize_sql(raw_query)
+    
+    # Apply case augmentation if enabled (Fix #2: Schema Anchor)
+    if case_augment:
+        schema_context, target_sql = augment_case(schema_context, target_sql, db_id, db_schemas)
 
     # Format with template
     formatted_text = template.format_prompt(
@@ -211,6 +205,78 @@ def format_sample(
         "raw_query": raw_query,
         "target_sql": target_sql,
     }
+
+
+import random
+
+def augment_case(schema: str, sql: str, db_id: str, db_schemas: Dict[str, Any]) -> tuple:
+    """
+    Schema Case Augmentation (Fix #2: Schema Anchor)
+    ================================================
+    Randomly transforms table/column names to force model to copy from schema.
+    
+    Transformations:
+    - UPPER: "name" -> "NAME"
+    - lower: "Name" -> "name"
+    - Title: "name" -> "Name"
+    - CamelCase: "user_id" -> "UserId"
+    
+    Returns:
+        (augmented_schema, augmented_sql)
+    """
+    if db_id not in db_schemas:
+        return schema, sql
+    
+    schema_info = db_schemas[db_id]
+    table_names = schema_info["table_names_original"]
+    column_names = [col[1] for col in schema_info["column_names_original"] if col[0] >= 0]
+    
+    # Build mapping: original -> transformed
+    case_map = {}
+    
+    def random_transform(name: str) -> str:
+        """Apply random case transformation."""
+        transform = random.choice(["upper", "lower", "title", "camel", "original"])
+        
+        if transform == "upper":
+            return name.upper()
+        elif transform == "lower":
+            return name.lower()
+        elif transform == "title":
+            return name.title()
+        elif transform == "camel":
+            # user_id -> UserId
+            parts = name.split("_")
+            return "".join(p.title() for p in parts)
+        else:
+            return name  # Keep original
+    
+    # Transform table names
+    for table in table_names:
+        if table not in case_map:
+            case_map[table] = random_transform(table)
+    
+    # Transform column names
+    for col in column_names:
+        if col not in case_map and col != "*":
+            case_map[col] = random_transform(col)
+    
+    # Apply to schema and SQL
+    augmented_schema = schema
+    augmented_sql = sql
+    
+    # Sort by length (longest first) to avoid partial replacements
+    sorted_names = sorted(case_map.keys(), key=len, reverse=True)
+    
+    for original in sorted_names:
+        transformed = case_map[original]
+        
+        # Replace in schema (word boundary aware)
+        pattern = r'\b' + re.escape(original) + r'\b'
+        augmented_schema = re.sub(pattern, transformed, augmented_schema, flags=re.IGNORECASE)
+        augmented_sql = re.sub(pattern, transformed, augmented_sql, flags=re.IGNORECASE)
+    
+    return augmented_schema, augmented_sql
 
 
 
@@ -387,14 +453,17 @@ def main(args):
 
     # --- Format Data ---
     print("\nFormatting training data...")
+    if args.case_augment:
+        print("  Case augmentation ENABLED (Run #3 fix)")
     train_formatted = [
-        format_sample(ex, db_schemas, template, args.schema_format)
+        format_sample(ex, db_schemas, template, args.schema_format, case_augment=args.case_augment)
         for ex in tqdm(raw_train, desc="Train")
     ]
 
     print("Formatting validation data...")
+    # Note: Don't augment validation data - we want to evaluate on original casing
     dev_formatted = [
-        format_sample(ex, db_schemas, template, args.schema_format)
+        format_sample(ex, db_schemas, template, args.schema_format, case_augment=False)
         for ex in tqdm(raw_dev, desc="Dev")
     ]
 
@@ -496,6 +565,13 @@ if __name__ == "__main__":
         dest="oversample",
         help="Disable oversampling"
     )
+    parser.add_argument(
+        "--case-augment",
+        action="store_true",
+        default=False,
+        help="Apply schema case augmentation (Run #3 fix: forces model to read schema)"
+    )
     
     args = parser.parse_args()
     main(args)
+
