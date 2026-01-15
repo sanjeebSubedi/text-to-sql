@@ -2,6 +2,8 @@
 
 > Convert natural language questions into SQL queries using fine-tuned language models.
 
+[![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
+
 ## Overview
 
 This project fine-tunes small language models using **QLoRA** (Quantized Low-Rank Adaptation) on the [Spider dataset](https://yale-lily.github.io/spider) to specialize in text-to-SQL conversion. The fine-tuned models can generate syntactically correct and semantically accurate SQL queries from natural language questions, given a database schema.
@@ -104,6 +106,18 @@ text-to-sql/
 
 ## Training Details
 
+### Model Configuration
+
+| Parameter | Value |
+|-----------|-------|
+| Base Model | Phi-3-mini-4k-instruct |
+| LoRA Rank (r) | 16 |
+| LoRA Alpha | 16 |
+| Training Steps | 524 (2 epochs) |
+| Batch Size | 4 |
+| Learning Rate | 2e-4 |
+| Quantization | 4-bit (NF4) |
+
 ### Training Data
 
 - **Dataset**: Spider (Yale)
@@ -119,3 +133,15 @@ text-to-sql/
 - **Demo**: Streamlit
 - **Database**: SQLite
 
+## Limitations & Future Work
+
+### Current Limitations
+- Optimized for SQLite syntax only
+- Complex nested subqueries may have lower accuracy
+- Schema size limited by context window
+
+### Future Improvements
+- [ ] Schema linking/pruning for large databases
+- [ ] Self-consistency decoding
+- [ ] Support for multiple SQL dialects
+- [ ] Streaming generation
